@@ -6,6 +6,14 @@ from .layers import dense_layers, grafiti
 from .utils import preprocess, reshape_
 
 class ProFITi(nn.Module):
+'''
+input_dim: Number of channels in the time series
+latent_dim: Size of hidden layers
+attn_head: Number of attention heads required for GraFITi
+n_layers: Number of GraFITi layers
+f_layers: Number of Flow layers
+device: 'cuda' or 'cpu'
+'''
     def __init__(
         self,
         input_dim=41,
@@ -32,27 +40,23 @@ class ProFITi(nn.Module):
             self.k_proj.append(nn.Linear(latent_dim, latent_dim))
 
 
-    def alpha(self, x, t=1):
-        return torch.arcsinh(np.exp(t)*torch.sinh(x))
+    def alpha(self, x, t = 1., a = 1.0):
+        return torch.arcsinh(np.exp(a*t)*torch.sinh(a*x))/a
     
-    def jfa(self, x, t=1):
-        den = 1+(np.exp(t)*torch.sinh(x))**2
-        jac = np.exp(t)*torch.cosh(x)/(den**0.5)
+    def jfa(self, x, t=1, a = 0):
+        den = 1+(np.exp(a*t)*torch.sinh(a*x))**2
+        jac = np.exp(a*t)*torch.cosh(a*x)/(den**0.5)
         return jac
     
-    def fa(self, x, mask, t = 1):
-        asd = torch.abs(x) > 30
+    def fa(self, x, mask, t = 1.0, a = 1.0):
+        large_inds = torch.abs(x) > 5
         int_val = torch.zeros_like(x)
         jac = torch.ones_like(x)
-        int_val[asd] = x[asd] + torch.sign(x[asd])
-        int_val[~asd] = self.alpha(x[~asd], t)
-        jac[~asd] = self.jfa(x[~asd])
+        int_val[large_inds] = x[large_inds] + torch.sign(x[large_inds])
+        int_val[~large_inds] = self.alpha(x[~large_inds], t, a)
+        jac[~large_inds] = self.jfa(x[~large_inds])
         return int_val*mask[:,:,None], jac.squeeze(-1)*mask
-    
-    def lrelu_fn(self, x, mask):
-        jac = torch.where(x<0, 0.01, 1)
-        x *= jac
-        return x*mask[:,:,None], jac.squeeze(-1)*mask
+
 
     def fc_det(self, J, Jmask, idtensor):
         asd = (1-Jmask)*idtensor
@@ -63,9 +67,9 @@ class ProFITi(nn.Module):
     def fc(self, U, QM, id_tensor, i):
         query = self.q_proj[i](U)
         key = self.k_proj[i](U)
-        scores = torch.bmm(query, key.transpose(-2, -1))
-        A = scores.masked_fill(id_tensor == 1, 0) / torch.sqrt(torch.tensor(query.shape[-1], dtype=torch.float32))
-        B = scores.masked_fill(id_tensor == 0, -1e8) / torch.sqrt(torch.tensor(query.shape[-1], dtype=torch.float32))
+        scores = torch.bmm(query, key.transpose(-2, -1)) / torch.sqrt(torch.tensor(query.shape[-1], dtype=torch.float32))
+        A = scores.masked_fill(id_tensor == 1, 0) 
+        B = scores.masked_fill(id_tensor == 0, -1e8)
         A += torch.nn.Softplus()(B)
         return torch.tril(A)
 
@@ -107,5 +111,5 @@ class ProFITi(nn.Module):
         return Z_.squeeze(-1), LJD
     
     def forward(self, TX: Tensor, X: Tensor, MX: Tensor, TY: Tensor, Y: Tensor, MY: Tensor):
-        z, J, yhat, Jdet = self.z(TX,X,MX,TY,Y,MY)
-        return z, J, yhat, Jdet
+        z, LJD = self.z(TX,X,MX,TY,Y,MY)
+        return z, LJD

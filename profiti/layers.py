@@ -47,6 +47,7 @@ class Q_MAB(nn.Module):
         return output
 
 class grafiti(nn.Module):
+''' Modified from GraFITi (https://anonymous.4open.science/r/GraFITi-8F7B/README.md) '''
     def __init__(self, dim, latent_dim, n_layers, f_layers, attn_head, device='cuda'):
         super(grafiti, self).__init__()
         self.dim = dim+2
