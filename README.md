@@ -1,6 +1,6 @@
 # ProFITi
 
-This is the source code for the paper ''ProFITi: Probabilistic Forecasting of Irregular Time series with Conditional Flows''
+This is the source code for the paper ''[ProFITi: Probabilistic Forecasting of Irregular Time series with Conditional Flows](https://arxiv.org/abs/2402.06293)''
 
 # Requirements
 python		3.8.11
