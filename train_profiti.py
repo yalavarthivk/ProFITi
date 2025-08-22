@@ -1,215 +1,417 @@
+#!/usr/bin/env python3
+
+import argparse
+import logging
+import os
+import random
+import sys
+import time
+from pathlib import Path
+from typing import Dict, Any, Tuple
+
 import numpy as np
 import torch
-import sys
-import os
-import argparse
-import time
-from random import SystemRandom
-import random
+import torch.nn as nn
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 import torchinfo
 
-os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-torch.backends.cudnn.benchmark = True
-torch.autograd.set_detect_anomaly(True)
-# fmt: off
-parser = argparse.ArgumentParser(description="Training Script for ProFITi.")
-parser.add_argument("-e",  "--epochs",       default=500,    type=int,   help="maximum epochs")
-parser.add_argument("-f",  "--fold",         default=0,      type=int,   help="fold number")
-parser.add_argument("-bs", "--batch-size",   default=128,     type=int,   help="batch-size")
-parser.add_argument("-lr", "--learn-rate",   default=0.001,  type=float, help="learn-rate")
-parser.add_argument("-b",  "--betas", default=(0.9, 0.999),  type=float, help="adam betas", nargs=2)
-parser.add_argument("-wd", "--weight-decay", default=0.001,  type=float, help="weight-decay")
-parser.add_argument("-hs", "--hidden-size",  default=32,    type=int,   help="hidden-size")
-parser.add_argument("-s",  "--seed",         default=None,   type=int,   help="Set the random seed.")
-parser.add_argument("-nl",  "--nlayers", default=4,   type=int,   help="")
-parser.add_argument("-ahd",  "--attn-head", default=1,   type=int,   help="")
-parser.add_argument("-ldim",  "--latent-dim", default=64,   type=int,   help="")
-parser.add_argument("-dset", "--dataset", default="physionet2012", type=str, help="Name of the dataset")
-parser.add_argument("-ft", "--forc-time", default=0, type=int, help="forecast horizon in hours")
-parser.add_argument("-ct", "--cond-time", default=36, type=int, help="conditioning range in hours")
-parser.add_argument("-nf", "--nfolds", default=5, type=int, help="#folds for crossvalidation")
-parser.add_argument("-fl", "--flayers", default=3, type=int, help="number of layers in the flow")
-parser.add_argument("--std", default=1, type=float, help='standard devaiation of base gaussian')
-parser.add_argument("--marginal", default=1, type=int, help='do we want marginal?')
-parser.add_argument("--use-prelu", default=0, type=int, help='use prelu')
-parser.add_argument("--use-alpha", default=1, type=int, help='use alpha')
-parser.add_argument("--use-lrelu", default=0, type=int, help='use lrelu')
-# fmt: on
-ARGS = parser.parse_args()
-print(' '.join(sys.argv))
-experiment_id = int(SystemRandom().random() * 10000000)
-print(ARGS, experiment_id)
-
-if ARGS.seed is not None:
-    torch.manual_seed(ARGS.seed)
-    random.seed(ARGS.seed)
-    np.random.seed(ARGS.seed)
-
-OPTIMIZER_CONFIG = {
-    "lr": ARGS.learn_rate,
-    "betas": torch.tensor(ARGS.betas),
-    "weight_decay": ARGS.weight_decay,
-}
-
-if ARGS.dataset=="mimiciii":
-    from tsdm.tasks.mimic_iii_debrouwer2019 import MIMIC_III_DeBrouwer2019
-    TASK = MIMIC_III_DeBrouwer2019(normalize_time=True, condition_time=ARGS.cond_time, forecast_horizon = ARGS.forc_time, num_folds=ARGS.nfolds)
-elif ARGS.dataset=="mimiciv":
-    from tsdm.tasks.mimic_iv_bilos2021 import MIMIC_IV_Bilos2021
-    TASK = MIMIC_IV_Bilos2021(normalize_time=True, condition_time=ARGS.cond_time, forecast_horizon = ARGS.forc_time, num_folds=ARGS.nfolds)
-elif ARGS.dataset=='physionet2012':
-    from tsdm.tasks.physionet2012 import Physionet2012
-    TASK = Physionet2012(normalize_time=True, condition_time=ARGS.cond_time, forecast_horizon = ARGS.forc_time, num_folds=ARGS.nfolds)
-
-
+from profiti.model import ProFITi
 from profiti.utils import profiti_collate_fn
 
-dloader_config_train = {
-    "batch_size": ARGS.batch_size,
-    "shuffle": True,
-    "drop_last": True,
-    "pin_memory": True,
-    "num_workers": 4,
-    "collate_fn": profiti_collate_fn,
-}
 
-dloader_config_infer = {
-    "batch_size": 128,
-    "shuffle": False,
-    "drop_last": False,
-    "pin_memory": True,
-    "num_workers": 0,
-    "collate_fn": profiti_collate_fn,
-}
-
-TRAIN_LOADER = TASK.get_dataloader((ARGS.fold, "train"), **dloader_config_train)
-VALID_LOADER = TASK.get_dataloader((ARGS.fold, "valid"), **dloader_config_infer)
-TEST_LOADER = TASK.get_dataloader((ARGS.fold, "test"), **dloader_config_infer)
-
-from profiti.utils import compute_losses, compute_marginal_losses
-losses = compute_losses(ARGS.std)
-marginal_losses = compute_marginal_losses(ARGS.std)
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-from profiti.profiti import ProFITi
-
-MODEL_CONFIG = {
-    "input_dim": TASK.dataset.shape[-1],
-    "attn_head": ARGS.attn_head,
-    "latent_dim": ARGS.latent_dim,
-    "n_layers": ARGS.nlayers,
-    "f_layers": ARGS.flayers,
-    "Lambda": ARGS.Lambda,
-    "use_prelu": ARGS.use_prelu,
-    "use_alpha": ARGS.use_alpha,
-    "use_lrelu": ARGS.use_lrelu,
-    "device": DEVICE
-}
-
-MODEL = ProFITi(**MODEL_CONFIG).to(DEVICE)
-torchinfo.summary(MODEL)
-
-def predict_fn(model, batch, marginal = 0):
-    """Get targets and predictions."""
-    T, X, M, TY, Y, MY = (tensor.to(DEVICE) for tensor in batch)
-    # pdb.set_trace()
-    Z, Jdet = model(T, X, M, TY, Y, MY, marginal)
-    return Y, MY, Z, Jdet
+def setup_logging() -> logging.Logger:
+    """Setup logging configuration."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=[logging.StreamHandler(), logging.FileHandler("training.log")],
+    )
+    return logging.getLogger(__name__)
 
 
-# Reset
-MODEL.zero_grad(set_to_none=True)
+def parse_arguments() -> argparse.Namespace:
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Training Script for ProFITi",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
 
-# ## Initialize Optimizer
-from torch.optim import AdamW
+    # Training parameters
+    training_group = parser.add_argument_group("Training Parameters")
+    training_group.add_argument(
+        "--epochs", "-e", type=int, default=500, help="Maximum number of epochs"
+    )
+    training_group.add_argument(
+        "--batch-size", "-bs", type=int, default=128, help="Training batch size"
+    )
+    training_group.add_argument(
+        "--learn-rate", "-lr", type=float, default=1e-3, help="Learning rate"
+    )
+    training_group.add_argument(
+        "--betas",
+        "-b",
+        nargs=2,
+        type=float,
+        default=[0.9, 0.999],
+        help="Adam optimizer betas",
+    )
+    training_group.add_argument(
+        "--weight-decay",
+        "-wd",
+        type=float,
+        default=1e-3,
+        help="Weight decay for regularization",
+    )
+    training_group.add_argument(
+        "--seed", "-s", type=int, default=42, help="Random seed for reproducibility"
+    )
 
-OPTIMIZER = AdamW(MODEL.parameters(), **OPTIMIZER_CONFIG)
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(OPTIMIZER, 'min', patience=10, factor=0.5, min_lr=0.00001, verbose=True)
-es = False
-best_val_loss = 10e8
-early_stop = 0
-for epoch in range(1, ARGS.epochs+1):
-    loss_list = []
-    count, train_nll = 0,0
-    start_time = time.time()
-    # training
-    MODEL.train()
-    for batch in (TRAIN_LOADER):
-        # print('batch')
-        OPTIMIZER.zero_grad()
-        Y, MY, Z, Jdet = predict_fn(MODEL, batch)
-        # pdb.set_trace()
-        NLL = losses.loss(Y, MY, Z, Jdet)
-        mask_sum = MY.sum((1,2)).bool().sum()
-        train_nll += NLL*mask_sum
-        count += mask_sum
-        # Backward
-        NLL.backward()
-        OPTIMIZER.step()
-    epoch_time = time.time()
-    print('epoch: {}, train_nll: {:.4f}, epoch_time: {:.2f}'.format(
-        epoch,
-        train_nll/count,
-        epoch_time - start_time
-    ))
-    count = 0
-    val_nll = 0
+    # Model parameters
+    model_group = parser.add_argument_group("Model Parameters")
+    model_group.add_argument(
+        "--hidden-size", "-hs", type=int, default=32, help="Hidden layer size"
+    )
+    model_group.add_argument(
+        "--nlayers", "-nl", type=int, default=4, help="Number of layers"
+    )
+    model_group.add_argument(
+        "--attn-head", "-ahd", type=int, default=1, help="Number of attention heads"
+    )
+    model_group.add_argument(
+        "--latent-dim", "-ldim", type=int, default=64, help="Latent dimension size"
+    )
+    model_group.add_argument(
+        "--flayers", "-fl", type=int, default=3, help="Number of flow layers"
+    )
 
-    MODEL.eval()
-    with torch.no_grad():
-        # validation
-        for batch in (VALID_LOADER):
-            Y, MY, Z, Jdet = predict_fn(MODEL, batch)
-            NLL = losses.loss(Y, MY, Z, Jdet)
-            mask_sum = MY.sum((1,2)).bool().sum()
-            val_nll += NLL*mask_sum
-            count += mask_sum
-    print('val_nll: {: .6f}'.format(
-        val_nll/count,
-    ))
-    val_loss = val_nll/count
-    # saving best model
-    # break
-    if val_loss < best_val_loss:
-        best_val_loss = val_loss
-    
-        torch.save({    'args': ARGS,
-                        'epoch': epoch,
-                        'state_dict': MODEL.state_dict(),
-                        'optimizer_state_dict': OPTIMIZER.state_dict(),
-                        'loss': val_loss,
-                    }, 'saved_models/'+ARGS.dataset + '_' + str(experiment_id) + '.h5')
-        early_stop = 0
+    # Dataset parameters
+    data_group = parser.add_argument_group("Dataset Parameters")
+    data_group.add_argument(
+        "--dataset",
+        "-dset",
+        type=str,
+        default="physionet2012",
+        choices=["physionet2012", "mimiciii", "mimiciv"],
+        help="Dataset to use",
+    )
+    data_group.add_argument(
+        "--forc-time", "-ft", type=int, default=0, help="Forecast horizon in hours"
+    )
+    data_group.add_argument(
+        "--cond-time", "-ct", type=int, default=36, help="Conditioning range in hours"
+    )
+    data_group.add_argument(
+        "--nfolds",
+        "-nf",
+        type=int,
+        default=5,
+        help="Number of folds for cross-validation",
+    )
+    data_group.add_argument(
+        "--fold", "-f", type=int, default=0, help="Current fold number"
+    )
+
+    # Additional parameters
+    misc_group = parser.add_argument_group("Miscellaneous")
+    misc_group.add_argument(
+        "--output-dir",
+        type=str,
+        default="saved_models",
+        help="Directory to save models",
+    )
+    misc_group.add_argument(
+        "--early-stop-patience", type=int, default=30, help="Early stopping patience"
+    )
+    misc_group.add_argument(
+        "--scheduler-patience", type=int, default=10, help="Scheduler patience"
+    )
+
+    return parser.parse_args()
+
+
+def setup_environment(seed: int) -> torch.device:
+    """Setup environment and random seeds."""
+    # Set random seeds for reproducibility
+    torch.manual_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+
+    # CUDA optimizations
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = True
+        os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
+    # Enable anomaly detection for debugging
+    torch.autograd.set_detect_anomaly(True)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return device
+
+
+def load_dataset(args: argparse.Namespace):
+    """Load the specified dataset."""
+    dataset_config = {
+        "normalize_time": True,
+        "condition_time": args.cond_time,
+        "forecast_horizon": args.forc_time,
+        "num_folds": args.nfolds,
+    }
+
+    if args.dataset == "mimiciii":
+        from tsdm.tasks.mimic_iii_debrouwer2019 import MIMIC_III_DeBrouwer2019
+
+        return MIMIC_III_DeBrouwer2019(**dataset_config)
+    elif args.dataset == "mimiciv":
+        from tsdm.tasks.mimic_iv_bilos2021 import MIMIC_IV_Bilos2021
+
+        return MIMIC_IV_Bilos2021(**dataset_config)
+    elif args.dataset == "physionet2012":
+        from tsdm.tasks.physionet2012 import Physionet2012
+
+        return Physionet2012(**dataset_config)
     else:
-        early_stop += 1
-    if early_stop == 30:
-        print("Early stopping because of no improvement in val. metric for 30 epochs")
-        es = True
-    scheduler.step(val_loss)
+        raise ValueError(f"Unknown dataset: {args.dataset}")
 
-    # LOGGER.log_epoch_end(epoch)
-    if (epoch == ARGS.epochs) or (es == True):
-        chp = torch.load('saved_models/' + ARGS.dataset + '_' + str(experiment_id) + '.h5')
-        MODEL.load_state_dict(chp['state_dict'])
-        count = 0
-        test_nll = 0
+
+def create_dataloaders(task, fold: int, batch_size: int):
+    """Create train, validation, and test dataloaders."""
+    base_config = {
+        "pin_memory": True,
+        "num_workers": 4,
+        "collate_fn": profiti_collate_fn,
+    }
+
+    train_loader = task.get_dataloader(
+        (fold, "train"),
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=True,
+        **base_config,
+    )
+
+    eval_config = {
+        **base_config,
+        "batch_size": 128,
+        "shuffle": False,
+        "drop_last": False,
+    }
+    valid_loader = task.get_dataloader((fold, "valid"), **eval_config)
+    test_loader = task.get_dataloader((fold, "test"), **eval_config)
+
+    return train_loader, valid_loader, test_loader
+
+
+class Trainer:
+    """Elegant trainer class for ProFITi model."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        scheduler: torch.optim.lr_scheduler._LRScheduler,
+        device: torch.device,
+        logger: logging.Logger,
+    ):
+        self.model = model
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+        self.device = device
+        self.logger = logger
+        self.best_val_loss = float("inf")
+        self.early_stop_counter = 0
+
+    def train_epoch(self, train_loader) -> float:
+        """Train for one epoch."""
+        self.model.train()
+        total_loss = 0.0
+        total_samples = 0
+
+        for batch in train_loader:
+            # Move batch to device
+            batch = [tensor.to(self.device) for tensor in batch]
+            TX, CX, X, MX, TQ, CQ, Y, MQ = batch
+
+            # Forward pass
+            self.optimizer.zero_grad()
+            self.model.distribution(TX, CX, X, MX, TQ, CQ, MQ)
+            njNLL = self.model.compute_njnll(Y, MQ)
+
+            # Backward pass
+            loss = njNLL.mean()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.optimizer.step()
+
+            # Accumulate statistics
+            total_loss += njNLL.sum().item()
+            total_samples += TX.shape[0]
+
+        return total_loss / total_samples
+
+    def evaluate(self, data_loader) -> float:
+        """Evaluate model on given data loader."""
+        self.model.eval()
+        total_loss = 0.0
+        total_samples = 0
+
         with torch.no_grad():
-            # testing on the best model
-            eval_time_start = time.time()
-            for batch in (TEST_LOADER):
-                # Forward
-                Y, MY, Z, Jdet = predict_fn(MODEL, batch)
-                NLL = losses.loss(Y, MY, Z, Jdet)
-                mask_sum = MASK.sum((1,2)).bool().sum()
-                test_nll += NLL*mask_sum
-                count += mask_sum
-              
-        eval_time_end = time.time()
-        sample_eval_time = eval_time_end - eval_time_start
-        print('test_nll: {: .6f}, eval_time: {: .2f}s'.format(
-        test_nll/count,
-        sample_eval_time))
-        print("Best_val_loss: ",best_val_loss.item(), " test_loss : ", (test_nll/count).item())
-        break
+            for batch in data_loader:
+                batch = [tensor.to(self.device) for tensor in batch]
+                TX, CX, X, MX, TQ, CQ, Y, MQ = batch
+
+                self.model.distribution(TX, CX, X, MX, TQ, CQ, MQ)
+                njNLL = self.model.compute_njnll(Y, MQ)
+
+                total_loss += njNLL.sum().item()
+                total_samples += TX.shape[0]
+
+        return total_loss / total_samples
+
+    def save_checkpoint(self, filepath: str, epoch: int, args: argparse.Namespace):
+        """Save model checkpoint."""
+        torch.save(
+            {
+                "args": args,
+                "epoch": epoch,
+                "state_dict": self.model.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "best_val_loss": self.best_val_loss,
+            },
+            filepath,
+        )
+
+    def load_checkpoint(self, filepath: str):
+        """Load model checkpoint."""
+        checkpoint = torch.load(filepath, map_location=self.device)
+        self.model.load_state_dict(checkpoint["state_dict"])
+        return checkpoint
+
+
+def main():
+    """Main training function."""
+    # Setup
+    args = parse_arguments()
+    logger = setup_logging()
+    device = setup_environment(args.seed)
+
+    logger.info("Arguments: %s", args)
+    logger.info("Using device: %s", device)
+
+    # Create output directory
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(exist_ok=True)
+
+    # Load dataset and create dataloaders
+    task = load_dataset(args)
+    train_loader, valid_loader, test_loader = create_dataloaders(
+        task, args.fold, args.batch_size
+    )
+
+    # Initialize model
+    model_config = {
+        "input_dim": task.dataset.shape[-1],
+        "attn_head": args.attn_head,
+        "latent_dim": args.latent_dim,
+        "n_layers": args.nlayers,
+        "f_layers": args.flayers,
+        "device": device,
+    }
+
+    model = ProFITi(**model_config).to(device)
+    logger.info("Model summary:\n%s", torchinfo.summary(model))
+
+    # Initialize optimizer and scheduler
+    optimizer = AdamW(
+        model.parameters(),
+        lr=args.learn_rate,
+        betas=args.betas,
+        weight_decay=args.weight_decay,
+    )
+
+    scheduler = ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        patience=args.scheduler_patience,
+        factor=0.5,
+        min_lr=1e-5,
+        verbose=True,
+    )
+
+    # Initialize trainer
+    trainer = Trainer(model, optimizer, scheduler, device, logger)
+
+    # Generate experiment ID and model path
+    experiment_id = int(time.time() * 1000) % 10000000
+    model_path = output_dir / f"{args.dataset}_fold{args.fold}_{experiment_id}.pt"
+
+    logger.info("Starting training with experiment ID: %d", experiment_id)
+
+    # Training loop
+    for epoch in range(1, args.epochs + 1):
+        start_time = time.time()
+
+        # Train
+        train_loss = trainer.train_epoch(train_loader)
+
+        # Validate
+        val_loss = trainer.evaluate(valid_loader)
+
+        epoch_time = time.time() - start_time
+
+        logger.info(
+            "Epoch %3d/%d | Train Loss: %.6f | Val Loss: %.6f | Time: %.2fs",
+            epoch,
+            args.epochs,
+            train_loss,
+            val_loss,
+            epoch_time,
+        )
+
+        # Save best model and check early stopping
+        if val_loss < trainer.best_val_loss:
+            trainer.best_val_loss = val_loss
+            trainer.save_checkpoint(str(model_path), epoch, args)
+            trainer.early_stop_counter = 0
+            logger.info("New best model saved with val_loss: %.6f", val_loss)
+        else:
+            trainer.early_stop_counter += 1
+
+        # Early stopping
+        if trainer.early_stop_counter >= args.early_stop_patience:
+            logger.info(
+                "Early stopping after %d epochs without improvement",
+                args.early_stop_patience,
+            )
+            break
+
+        # Update scheduler
+        scheduler.step(val_loss)
+
+    # Final evaluation on test set
+    logger.info("Loading best model for final evaluation...")
+    trainer.load_checkpoint(str(model_path))
+
+    start_time = time.time()
+    test_loss = trainer.evaluate(test_loader)
+    eval_time = time.time() - start_time
+
+    logger.info("Final Results:")
+    logger.info("Best Val Loss: %.6f", trainer.best_val_loss)
+    logger.info("Test Loss: %.6f", test_loss)
+    logger.info("Evaluation Time: %.2fs", eval_time)
+
+    return {
+        "best_val_loss": trainer.best_val_loss,
+        "test_loss": test_loss,
+        "experiment_id": experiment_id,
+    }
+
+
+if __name__ == "__main__":
+    main()
