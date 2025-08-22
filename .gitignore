@@ -1,3 +1,4 @@
 *.ipynb
 saved_models/*
 old_profiti
+training.log
