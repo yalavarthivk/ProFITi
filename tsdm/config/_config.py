@@ -115,8 +115,8 @@ LOGDIR.mkdir(parents=True, exist_ok=True)
 #     datefmt="%Y-%m-%d %H:%M:%S",
 #     level=logging.INFO)
 
-__logger__.info("Available Models: %s", set(MODELS))
-__logger__.info("Available Datasets: %s", set(DATASETS))
+# __logger__.info("Available Models: %s", set(MODELS))
+# __logger__.info("Available Datasets: %s", set(DATASETS))
 
 
 def generate_folders(d: dict, current_path: Path) -> None:

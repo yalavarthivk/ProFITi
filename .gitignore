@@ -2,3 +2,5 @@
 saved_models/*
 old_profiti
 training.log
+tsdm/random/__pycache__/__init__.cpython-311.pyc
+.vscode

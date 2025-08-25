@@ -12,13 +12,13 @@ from ..layers import dense_layers
 class FlowLayer(nn.Module):
     """Single normalizing flow layer with triangular attention and affine transformation."""
 
-    def __init__(self, hidden_dim: int, device: torch.device):
+    def __init__(self, hidden_dim: int, marginal_training: bool, device: torch.device):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.device = device
 
         # Components
-        self.attention = TriangularAttention(hidden_dim, device)
+        self.attention = TriangularAttention(hidden_dim, marginal_training, device)
         self.scale_net = dense_layers(2, hidden_dim, device=device)
         self.shift_net = dense_layers(2, hidden_dim, device=device)
 
@@ -97,7 +97,12 @@ class FlowLayer(nn.Module):
         ldj -= torch.sum(scale * mask, dim=-1)
 
         # Inverse triangular attention
-        attention_matrix = self.attention(hidden_states, mask)
+        diag_ones = torch.diag_embed(1 - mask)
+
+        attention_matrix = (
+            self.attention(hidden_states, mask)
+        ) + diag_ones  # add 1s on diagonal for masked positions to make it non-singular
+
         z = torch.linalg.solve_triangular(
             attention_matrix, z.unsqueeze(-1), upper=False
         ).squeeze(-1)
@@ -112,13 +117,22 @@ class FlowLayer(nn.Module):
 class NormalizingFlow(nn.Module):
     """Multi-layer normalizing flow."""
 
-    def __init__(self, num_layers: int, hidden_dim: int, device: torch.device):
+    def __init__(
+        self,
+        num_layers: int,
+        hidden_dim: int,
+        marginal_training: bool,
+        device: torch.device,
+    ):
         super().__init__()
         self.num_layers = num_layers
         self.device = device
 
         self.layers = nn.ModuleList(
-            [FlowLayer(hidden_dim, device) for _ in range(num_layers)]
+            [
+                FlowLayer(hidden_dim, marginal_training, device)
+                for _ in range(num_layers)
+            ]
         )
 
         # Base distribution offset

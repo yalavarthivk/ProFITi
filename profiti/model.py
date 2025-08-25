@@ -10,7 +10,7 @@ from .change_rep import obs_rep
 from .core.flow_layers import NormalizingFlow
 from .core.sampling import ProFITiSampler
 from .core.base_model import BaseFlowModel
-from .utils import compute_crps, compute_energy_score, compute_jnll
+from .utils import compute_crps, compute_energy_score, compute_jnll, compute_mnll
 import pdb
 
 
@@ -29,6 +29,7 @@ class ProFITi(nn.Module, BaseFlowModel):
         n_layers: int,
         f_layers: int,
         attn_head: int,
+        marginal_training: bool,
         device: torch.device,
     ):
         """
@@ -52,13 +53,15 @@ class ProFITi(nn.Module, BaseFlowModel):
         self.conditioning_module = GraFITi(
             input_dim, attn_head, latent_dim, n_layers, device
         )
-        self.flow = NormalizingFlow(f_layers, latent_dim, device)
+        self.flow = NormalizingFlow(f_layers, latent_dim, marginal_training, device)
         self.likelihood = compute_jnll()
-        self.sampler = ProFITiSampler(self)
+        self.marg_likelihood = compute_mnll()
         self._cached_samples = None  # to store generated samples
         self._cached_mask = None  # to know which mask the samples correspond
+        self._cached_log_det = None  # to store log_det if needed later
         # Cache for hidden states
         self._hidden_states: Optional[Tensor] = None
+        self.marginal_training = marginal_training
 
     @property
     def hidden_states(self) -> Optional[Tensor]:
@@ -130,6 +133,7 @@ class ProFITi(nn.Module, BaseFlowModel):
         self.encode_context(tx, cx, x, mx, tq, cq, mq)
         self._cached_samples = None  # to store generated samples
         self._cached_mask = None  # to know which mask the samples correspond
+        self._cached_log_det = None  # to store log_det if needed later
 
     def compute_njnll(self, y: Tensor, mask: Tensor) -> Tensor:
         """
@@ -156,8 +160,20 @@ class ProFITi(nn.Module, BaseFlowModel):
 
         return normalized_nll
 
+    def compute_mnll(self, y: Tensor, mask: Tensor) -> Tensor:
+        if self._hidden_states is None:
+            raise RuntimeError("Must call distribution/encode_context first")
+
+        # Apply forward flow
+        z, ldj = self.forward_flow(y, mask)
+
+        # Compute likelihood
+        marg_nll = self.marg_likelihood(z, mask, ldj)
+
+        return marg_nll.sum()  # B
+
     # Sampling interface (delegates to sampler)
-    def samples(self, mask: Tensor, nsamples: int = 100) -> Tensor:
+    def samples(self, mask: Tensor, nsamples: int = 1000) -> Tensor:
         """Generate or return cached samples for a given mask."""
         # If we already have samples for this mask and nsamples, reuse them
         if (
@@ -165,41 +181,66 @@ class ProFITi(nn.Module, BaseFlowModel):
             and self._cached_mask is not None
             and torch.equal(mask, self._cached_mask)
         ):
-            return self._cached_samples
+            return self._cached_samples, self._cached_log_det  # unused here
 
         # Otherwise, generate new samples
-        self._cached_samples = self.sampler.sample(mask, nsamples)
-        self._cached_mask = mask.clone()  # store a copy
-        return self._cached_samples
+        batch_size, seq_len = mask.shape
+        base_samples = torch.randn(batch_size * nsamples, seq_len, device=self.device)
 
-    def mean(self, mask: Tensor) -> Tensor:
+        # Repeat mask for all samples
+        mask_expanded = mask.repeat(nsamples, 1)
+
+        # Apply inverse flow
+        samples, log_det = self.flow.inverse(
+            base_samples,
+            self.hidden_states.repeat(nsamples, 1, 1),
+            mask_expanded,
+        )
+
+        # Reshape outputs
+        samples = samples.reshape(nsamples, batch_size, seq_len)
+        samples = samples.permute(1, 0, 2)
+        log_det = log_det.reshape(nsamples, batch_size)  # unused here
+        log_det = log_det.permute(1, 0)
+        self._cached_samples = samples
+        self._cached_mask = mask.clone()  # store a copy
+        self._cached_log_det = log_det  # store log_det if needed later
+        return self._cached_samples, self._cached_log_det
+
+    def model_mean(self, mask: Tensor, nsamples: int = 1000) -> Tensor:
         """Compute empirical mean."""
-        yhat_samples = self.samples(mask, nsamples=1000)
+        yhat_samples, _ = self.samples(mask, nsamples=nsamples)
         yhat_mean = torch.mean(yhat_samples, dim=1)
         return yhat_mean
 
-    def robust_mean(self, mask: Tensor, nsamples: int = 100) -> Tensor:
+    def model_robust_mean(self, mask: Tensor, nsamples: int = 1000) -> Tensor:
         """Compute robust mean (currently same as regular mean)."""
-        yhat_samples = self.samples(mask, nsamples=nsamples)
+        yhat_samples, _ = self.samples(mask, nsamples=nsamples)
         yhat_mean = torch.mean(yhat_samples, dim=1)
         # Placeholder for robust mean logic
         # TODO: Implement actual robust mean (e.g., trimmed mean)
         return yhat_mean
 
-    def mse(self, y, mask):
+    def mse(self, y, mask, nsamples: int = 1000) -> Tensor:
         """Compute Mean Squared Error."""
-        yhat_mean = self.mean(mask)
+        yhat_mean = self.model_mean(mask, nsamples=nsamples)
         sq_error = mask * (y - yhat_mean) ** 2
         return sq_error.sum() / mask.sum()
 
-    def crps(self, y: Tensor, mask: Tensor, nsamples: int = 100) -> Tensor:
+    def robust_mse(self, y, mask, nsamples: int = 1000) -> Tensor:
+        """Compute Robust Mean Squared Error."""
+        yhat_mean = self.model_robust_mean(mask, nsamples=nsamples)
+        sq_error = mask * (y - yhat_mean) ** 2
+        return sq_error.sum() / mask.sum()
+
+    def crps(self, y: Tensor, mask: Tensor, nsamples: int = 1000) -> Tensor:
         """Compute CRPS."""
-        yhat_samples = self.samples(mask, nsamples=nsamples)
+        yhat_samples, _ = self.samples(mask, nsamples=nsamples)
         crps_ = compute_crps(y, yhat_samples, mask)
         return crps_.sum() / mask.sum()
 
     def energy_score(self, y: Tensor, mask: Tensor, nsamples: int = 100) -> Tensor:
         """Compute energy score."""
-        yhat_samples = self.samples(mask, nsamples=nsamples)
+        yhat_samples, _ = self.samples(mask, nsamples=nsamples)
         energy_score_ = compute_energy_score(y, yhat_samples, mask)
         return energy_score_.mean()

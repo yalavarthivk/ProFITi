@@ -66,16 +66,6 @@ class BaseDatasetMetaClass(ABCMeta):
             else:
                 cls.DATASET_DIR = DATASETDIR / cls.__name__
 
-        # print(f"Setting Attribute {cls}.RAWDATA_DIR = {cls.RAWDATA_DIR}")
-        # print(f"{cls=}\n\n{args=}\n\n{kwargs.keys()=}\n\n")
-
-    # def __getitem__(cls, parent: type[BaseDataset]) -> type[BaseDataset]:
-    #     # if inspect.isabstract(cls):
-    #     cls.RAWDATA_DIR = parent.RAWDATA_DIR
-    #     print(f"Setting {cls}.RAWDATA_DIR = {parent.RAWDATA_DIR=}")
-    #     return cls
-    # return super().__getitem__(parent)
-
 
 class BaseDataset(ABC, metaclass=BaseDatasetMetaClass):
     r"""Abstract base class that all dataset must subclass.
@@ -572,8 +562,7 @@ class MultiFrameDataset(FrameDataset, Mapping, Generic[KeyVar]):
         force: bool = False,
         validate: bool = True,
         **kwargs: Any,
-    ) -> Mapping[KeyVar, Any]:
-        ...
+    ) -> Mapping[KeyVar, Any]: ...
 
     @overload
     def load(
@@ -583,8 +572,7 @@ class MultiFrameDataset(FrameDataset, Mapping, Generic[KeyVar]):
         force: bool = False,
         validate: bool = True,
         **kwargs: Any,
-    ) -> Any:
-        ...
+    ) -> Any: ...
 
     def load(
         self,

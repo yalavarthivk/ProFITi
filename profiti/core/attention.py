@@ -1,14 +1,15 @@
 """Attention mechanisms for ProFITi."""
 
+import pdb
+
 import torch
 from torch import nn, Tensor
-from typing import Optional
 
 
 class TriangularAttention(nn.Module):
     """Efficient triangular attention mechanism for normalizing flows."""
 
-    def __init__(self, hidden_dim: int, device: torch.device):
+    def __init__(self, hidden_dim: int, marginal_training: bool, device: torch.device):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.device = device
@@ -16,12 +17,12 @@ class TriangularAttention(nn.Module):
 
         self.q_proj = nn.Linear(hidden_dim, hidden_dim)
         self.k_proj = nn.Linear(hidden_dim, hidden_dim)
-
+        self.marginal_training = marginal_training
         # Initialize with small weights for stability
 
-    def forward(self, hidden_states: Tensor, mask: Tensor) -> Tensor:
+    def compute_full_sita(self, hidden_states: Tensor, mask: Tensor) -> Tensor:
         """
-        Compute triangular attention matrix.
+        Compute full triangular attention matrix.
 
         Args:
             hidden_states: [B, K, D] - Hidden states
@@ -58,9 +59,61 @@ class TriangularAttention(nn.Module):
 
         # Zero out invalid positions and add small epsilon for numerical stability
         attention_mask = torch.matmul(mask.unsqueeze(-1), mask.unsqueeze(-2))
-        scores_combined = scores_combined * attention_mask + 1e-3
+        scores_combined = (scores_combined + 1e-3) * attention_mask
 
         return torch.tril(scores_combined)
+
+    def compute_diag_sita(self, hidden_states: Tensor, mask: Tensor) -> Tensor:
+        """
+        Compute diagonal attention matrix for marginal training.
+
+        Args:
+            hidden_states: [B, K, D] - Hidden states
+            mask: [B, K] - Binary mask for valid positions
+
+        Returns:
+            Diagonal attention matrix [B, K, K]
+        """
+
+        # Compute queries and keys
+        query = self.q_proj(hidden_states)  # [B, K, D]
+        key = self.k_proj(hidden_states)  # [B, K, D]
+
+        # since we only need the diagonal, we perform element-wise multiplication
+        # and then sum over the last dimension
+        scores_unnormalized = query * key  # [B, K, D]; unnormalized scores
+        scores_normalized = (
+            scores_unnormalized * self.scale
+        )  # [B, K, D]; normalize scores with scale factor
+        scores = torch.sum(
+            scores_normalized, dim=-1
+        )  # [B, K]; summed scores at the last dimension
+
+        # Apply softplus to ensure positive values
+        positive_scores = torch.nn.functional.softplus(scores)
+
+        final_scores = positive_scores + 1e-3  # BxK
+
+        attn_matrix = torch.diag_embed(final_scores * mask)  # BxKxK
+
+        return attn_matrix
+
+    def forward(self, hidden_states: Tensor, mask: Tensor) -> Tensor:
+        """
+        Compute triangular attention matrix.
+
+        Args:
+            hidden_states: [B, K, D] - Hidden states
+            mask: [B, K] - Binary mask for valid positions
+
+        Returns:
+            Lower triangular attention matrix [B, K, K]
+        """
+        if self.marginal_training:
+            sita = self.compute_diag_sita(hidden_states, mask)
+        else:
+            sita = self.compute_full_sita(hidden_states, mask)
+        return sita
 
     def log_determinant(self, attention_matrix: Tensor, mask: Tensor) -> Tensor:
         """

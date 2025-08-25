@@ -19,8 +19,7 @@ class compute_jnll(nn.Module):
 
     def forward(self, z, mask, ldj):
         gnll = self.gnll(z) * mask  # B x (K)
-        gnll = gnll.sum(-1)  # B
-        jnll = gnll - ldj
+        jnll = gnll.sum(-1) - ldj  # B
         return jnll
 
 
@@ -37,7 +36,10 @@ class compute_mnll(nn.Module):
 
     def forward(self, z, mask, ldj):
         gnll = self.gnll(z) * mask  # B x (K)
-        mnll = gnll - ldj
+        mnll = (
+            gnll.sum(-1) - ldj
+        )  # B ideally in mnll we should have BxK as we are trying to predict for each variable.
+        # Howevery, ldj is sum of all that of univariates hence we sum gnll as well.
         return mnll
 
 
