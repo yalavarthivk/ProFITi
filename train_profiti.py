@@ -220,11 +220,13 @@ class Trainer:
     def __init__(
         self,
         model: nn.Module,
+        args,
         optimizer: torch.optim.Optimizer,
         scheduler: torch.optim.lr_scheduler._LRScheduler,
         device: torch.device,
         logger: logging.Logger,
     ):
+        self.args = args
         self.model = model
         self.optimizer = optimizer
         self.scheduler = scheduler
@@ -242,22 +244,28 @@ class Trainer:
         for batch in train_loader:
             # Move batch to device
             batch = [tensor.to(self.device) for tensor in batch]
-            TX, CX, X, MX, TQ, CQ, Y, MQ = batch
+            tx, cx, x, mx, tq, cq, y, mq = batch
 
             # Forward pass
             self.optimizer.zero_grad()
-            self.model.distribution(TX, CX, X, MX, TQ, CQ, MQ)
-            njNLL = self.model.compute_njnll(Y, MQ)
+            self.model.distribution(tx, cx, x, mx, tq, cq, mq)
+            if self.args.marginal_training:
+                mnll = self.model.compute_mnll(y, mq)
+                loss = mnll  # mnll is already averaged over all the queries
+                total_loss += mnll.item()
+                total_samples += mq.sum().item()
+            else:
+                njnll = self.model.compute_njnll(y, mq)
+                loss = njnll.mean()  # njnll is not averaged hence we take mean
+                total_loss += njnll.sum().item()
+                total_samples += tx.shape[0]
 
             # Backward pass
-            loss = njNLL.mean()
+
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
 
             # Accumulate statistics
-            total_loss += njNLL.sum().item()
-            total_samples += TX.shape[0]
 
         return total_loss / total_samples
 
@@ -270,13 +278,24 @@ class Trainer:
         with torch.no_grad():
             for batch in data_loader:
                 batch = [tensor.to(self.device) for tensor in batch]
-                TX, CX, X, MX, TQ, CQ, Y, MQ = batch
+                batch = [tensor.to(self.device) for tensor in batch]
+            tx, cx, x, mx, tq, cq, y, mq = batch
 
-                self.model.distribution(TX, CX, X, MX, TQ, CQ, MQ)
-                njNLL = self.model.compute_njnll(Y, MQ)
-
-                total_loss += njNLL.sum().item()
-                total_samples += TX.shape[0]
+            # Forward pass
+            self.optimizer.zero_grad()
+            self.model.distribution(tx, cx, x, mx, tq, cq, mq)
+            if self.args.marginal_training:
+                mnll = self.model.compute_mnll(y, mq)
+                total_loss += (
+                    mnll.item()
+                )  # mnll is already averaged over all the queries
+                total_samples += mq.sum().item()
+            else:
+                njnll = self.model.compute_njnll(y, mq)
+                total_loss += (
+                    njnll.sum().item()
+                )  # njnll is not averaged hence we take sum
+                total_samples += tx.shape[0]
 
         return total_loss / total_samples
 
@@ -352,7 +371,7 @@ def main():
     )
 
     # Initialize trainer
-    trainer = Trainer(model, optimizer, scheduler, device, logger)
+    trainer = Trainer(model, args, optimizer, scheduler, device, logger)
 
     # Generate experiment ID and model path
     experiment_id = int(time.time() * 1000) % 10000000
