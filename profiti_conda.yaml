@@ -1,4 +1,4 @@
-name: linodenet
+name: profiti_conda
 channels:
   - conda-forge
   - defaults
