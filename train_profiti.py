@@ -327,6 +327,8 @@ def main():
     device = setup_environment(args.seed)
 
     logger.info("Arguments: %s", args)
+    experiment_id = int(time.time() * 1000) % 10000000
+    logger.info("Starting training with experiment ID: %d", experiment_id)
     logger.info("Using device: %s", device)
 
     # Create output directory
@@ -374,10 +376,8 @@ def main():
     trainer = Trainer(model, args, optimizer, scheduler, device, logger)
 
     # Generate experiment ID and model path
-    experiment_id = int(time.time() * 1000) % 10000000
-    model_path = output_dir / f"{args.dataset}_fold{args.fold}_{experiment_id}.pt"
-
     logger.info("Starting training with experiment ID: %d", experiment_id)
+    model_path = output_dir / f"{args.dataset}_fold{args.fold}_{experiment_id}.pt"
 
     # Training loop
     for epoch in range(1, args.epochs + 1):
