@@ -152,10 +152,10 @@ def setup_environment(seed: int) -> torch.device:
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.deterministic = True
-        os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+       # os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
     # Enable anomaly detection for debugging
-    torch.autograd.set_detect_anomaly(True)
+    #torch.autograd.set_detect_anomaly(True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return device

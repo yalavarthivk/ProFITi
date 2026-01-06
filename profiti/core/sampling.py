@@ -28,7 +28,6 @@ class ProFITiSampler:
             samples: [B, num_samples, K] - Generated samples
             log_probs: [B, num_samples] - Log probabilities
         """
-        pdb.set_trace()
         batch_size, seq_len = mask.shape
         device = mask.device
 

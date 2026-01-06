@@ -17,6 +17,9 @@ matplotlib	3.8.2
 
 Please see `profiti_conda.yaml` file for more information
 
+
+Install shiesh activation function via `pip install -i https://test.pypi.org/simple/ shiesh`
+
 # Training and Evaluation
 
 We provide an example using ''phsyionet``.

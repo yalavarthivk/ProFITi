@@ -17,7 +17,7 @@ def batch_flatten(x_list, mask):
         List[Tensor]: List of flattened tensors with shape (B, K)
     """
     b, t, d = x_list[0].shape
-    m_flat = mask.view(b, t * d)
+    m_flat = mask.bool().view(b, t * d)
 
     observed_counts = m_flat.sum(dim=1)
     k = observed_counts.max().to(torch.int64).item()
