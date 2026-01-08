@@ -277,25 +277,24 @@ class Trainer:
 
         with torch.no_grad():
             for batch in data_loader:
-                batch = [tensor.to(self.device) for tensor in batch]
-                batch = [tensor.to(self.device) for tensor in batch]
-            tx, cx, x, mx, tq, cq, y, mq = batch
-
-            # Forward pass
-            self.optimizer.zero_grad()
-            self.model.distribution(tx, cx, x, mx, tq, cq, mq)
-            if self.args.marginal_training:
-                mnll = self.model.compute_mnll(y, mq)
-                total_loss += (
-                    mnll.item()
-                )  # mnll is already averaged over all the queries
-                total_samples += mq.sum().item()
-            else:
-                njnll = self.model.compute_njnll(y, mq)
-                total_loss += (
-                    njnll.sum().item()
-                )  # njnll is not averaged hence we take sum
-                total_samples += tx.shape[0]
+                batch_ = [tensor.to(self.device) for tensor in batch]
+                tx, cx, x, mx, tq, cq, y, mq = batch_
+    
+                # Forward pass
+                self.optimizer.zero_grad()
+                self.model.distribution(tx, cx, x, mx, tq, cq, mq)
+                if self.args.marginal_training:
+                    mnll = self.model.compute_mnll(y, mq)
+                    total_loss += (
+                        mnll.item()
+                    )  # mnll is already averaged over all the queries
+                    total_samples += mq.sum().item()
+                else:
+                    njnll = self.model.compute_njnll(y, mq)
+                    total_loss += (
+                        njnll.sum().item()
+                    )  # njnll is not averaged hence we take sum
+                    total_samples += tx.shape[0]
 
         return total_loss / total_samples
 
